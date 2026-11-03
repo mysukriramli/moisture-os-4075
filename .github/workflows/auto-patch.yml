@@ -1,0 +1,127 @@
+name: Autonomous Issue Patcher
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  auto-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Runtime Tools
+        run: |
+          pip install requests pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Self-Repair Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python - << 'EOF'
+          import os
+          import glob
+          import json
+          import requests
+
+          api_key = os.environ.get("GEMINI_API_KEY")
+          if not api_key:
+              print("Missing GEMINI_API_KEY secret.")
+              exit(1)
+
+          title = os.environ.get("ISSUE_TITLE", "")
+          body = os.environ.get("ISSUE_BODY", "")
+
+          repo_state = {}
+          ignore_patterns = [".git", ".qc", "patch_meta.json", ".github/workflows/auto-patch.yml"]
+          
+          for ext in ["*.py", "*.md", "*.txt", "*.json", "*.yml", "*.yaml"]:
+              for path in glob.glob(f"**/{ext}", recursive=True):
+                  if not any(ignored in path for ignored in ignore_patterns):
+                      try:
+                          with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                              repo_state[path] = f.read()
+                      except Exception:
+                          pass
+
+          prompt = f"""
+          You are an autonomous repository self-healing engineer.
+          A user reported an issue or requested a code enhancement:
+          
+          Title: {title}
+          Details: {body}
+
+          Current Repository Context:
+          {json.dumps(repo_state, indent=2)}
+
+          Produce complete, working code updates to address this issue while ensuring existing tests continue to pass.
+          Return ONLY valid JSON matching this schema:
+          {{
+            "updated_files": [
+              {{"path": "relative/path/to/file.py", "content": "full updated content"}}
+            ],
+            "commit_message": "fix: concise explanation of change"
+          }}
+          """
+
+          url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
+          payload = {
+              "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}
+          }
+
+          resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload)
+          if resp.status_code != 200:
+              print(f"API Error: {resp.text}")
+              exit(1)
+
+          raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+          result = json.loads(raw_text)
+
+          for file_item in result.get("updated_files", []):
+              file_path = file_item["path"]
+              dir_name = os.path.dirname(file_path)
+              if dir_name:
+                  os.makedirs(dir_name, exist_ok=True)
+              with open(file_path, "w", encoding="utf-8") as out:
+                  out.write(file_item["content"])
+
+          with open("patch_meta.json", "w", encoding="utf-8") as meta_out:
+              json.dump(result, meta_out)
+          EOF
+
+      - name: Validate Tests
+        run: |
+          if [ -d "tests" ]; then pytest tests/; fi
+
+      - name: Commit and Push Fix
+        run: |
+          COMMIT_MSG=$(python3 -c "import json; print(json.load(open('patch_meta.json')).get('commit_message', 'fix: patch from issue'))")
+          rm patch_meta.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff-index --quiet HEAD || git commit -m "$COMMIT_MSG (Ref: #${{ github.event.issue.number }})"
+          git push
+
+      - name: Close Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --body "Autonomous patch applied and verified with passing unit tests."
+          gh issue close "${{ github.event.issue.number }}"

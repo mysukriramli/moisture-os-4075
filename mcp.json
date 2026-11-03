@@ -1,0 +1,15 @@
+{
+  "name": "moisture-os-4075",
+  "version": "1.0.0",
+  "description": "Authentic global moisture intelligence network transforming atmospheric data into deterministic operational signals and MCP tools for autonomous agents.",
+  "tools": [
+    {
+      "name": "service_status",
+      "description": "Get current status and computations from this autonomous service",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ]
+}
